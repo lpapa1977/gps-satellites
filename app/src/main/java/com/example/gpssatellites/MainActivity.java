@@ -9,8 +9,10 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.location.GnssStatus;
 import android.location.LocationManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -61,10 +63,15 @@ public class MainActivity extends Activity {
                 SatelliteInfo satellite = new SatelliteInfo(
                         status.getSvid(i),
                         constellationName(status.getConstellationType(i)),
+                        status.getConstellationType(i),
                         status.getAzimuthDegrees(i),
                         status.getElevationDegrees(i),
                         status.getCn0DbHz(i),
-                        status.usedInFix(i)
+                        status.usedInFix(i),
+                        status.hasAlmanacData(i),
+                        status.hasEphemerisData(i),
+                        carrierFrequency(status, i),
+                        basebandSignal(status, i)
                 );
                 satellites.add(satellite);
             }
@@ -135,7 +142,7 @@ public class MainActivity extends Activity {
         ));
 
         summaryView = new TextView(this);
-        summaryView.setText("Centro: arriba de tu cabeza. Borde: horizonte. N es norte.");
+        summaryView.setText("Centro: arriba de tu cabeza. Borde: horizonte. El mapa marca NORTE, SUR, ESTE y OESTE.");
         summaryView.setTextSize(14);
         summaryView.setTextColor(Color.rgb(72, 84, 98));
         summaryView.setPadding(dp(18), dp(12), dp(18), dp(10));
@@ -220,30 +227,45 @@ public class MainActivity extends Activity {
             return;
         }
 
+        TextView sectionTitle = rowText("Listado completo de satelites", 18, true);
+        sectionTitle.setTextColor(Color.rgb(16, 42, 67));
+        sectionTitle.setPadding(0, 0, 0, dp(8));
+        listLayout.addView(sectionTitle);
+
         for (SatelliteInfo satellite : satellites) {
             LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(12), dp(10), dp(12), dp(10));
-            row.setBackgroundColor(Color.WHITE);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(dp(14), dp(12), dp(14), dp(12));
+            row.setBackground(cardBackground());
 
-            TextView id = rowText(satellite.constellation + " " + satellite.svid, 15, true);
-            row.addView(id, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            LinearLayout header = new LinearLayout(this);
+            header.setOrientation(LinearLayout.HORIZONTAL);
+            header.setGravity(Gravity.CENTER_VERTICAL);
+            row.addView(header);
 
-            TextView details = rowText(String.format(
-                    Locale.US,
-                    "%.0f deg az | %.0f deg el | %.1f dB",
-                    satellite.azimuth,
-                    satellite.elevation,
-                    satellite.signal
-            ), 13, false);
-            details.setGravity(Gravity.RIGHT);
-            row.addView(details);
+            TextView id = rowText(satellite.constellation + " " + satellite.svid, 16, true);
+            header.addView(id, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-            TextView fix = rowText(satellite.usedInFix ? " USADO" : " VISIBLE", 12, true);
+            TextView fix = rowText(satellite.usedInFix ? "USADO" : "VISIBLE", 12, true);
             fix.setTextColor(satellite.usedInFix ? Color.rgb(30, 125, 88) : Color.rgb(184, 122, 28));
             fix.setGravity(Gravity.RIGHT);
-            row.addView(fix);
+            header.addView(fix);
+
+            addDetail(row, "Constelacion", satellite.constellation);
+            addDetail(row, "SVID", String.valueOf(satellite.svid));
+            addDetail(row, "Tipo Android", String.valueOf(satellite.constellationType));
+            addDetail(row, "Azimut", formatDegrees(satellite.azimuth) + " desde el norte");
+            addDetail(row, "Elevacion", formatDegrees(satellite.elevation) + " sobre el horizonte");
+            addDetail(row, "Senal C/N0", formatDb(satellite.signal));
+            addDetail(row, "Usado en posicion", satellite.usedInFix ? "Si" : "No");
+            addDetail(row, "Almanaque", satellite.hasAlmanac ? "Disponible" : "No informado");
+            addDetail(row, "Efemerides", satellite.hasEphemeris ? "Disponibles" : "No informadas");
+            addDetail(row, "Frecuencia portadora", satellite.carrierFrequencyHz > 0f
+                    ? String.format(Locale.US, "%.3f MHz", satellite.carrierFrequencyHz / 1_000_000f)
+                    : "No informada");
+            addDetail(row, "Baseband C/N0", Float.isNaN(satellite.basebandCn0DbHz)
+                    ? "No informado"
+                    : formatDb(satellite.basebandCn0DbHz));
 
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
@@ -252,6 +274,13 @@ public class MainActivity extends Activity {
             params.setMargins(0, 0, 0, dp(8));
             listLayout.addView(row, params);
         }
+    }
+
+    private void addDetail(LinearLayout row, String label, String value) {
+        TextView detail = rowText(label + ": " + value, 13, false);
+        detail.setTextColor(Color.rgb(72, 84, 98));
+        detail.setPadding(0, dp(4), 0, 0);
+        row.addView(detail);
     }
 
     private TextView rowText(String text, int sp, boolean bold) {
@@ -263,6 +292,36 @@ public class MainActivity extends Activity {
             view.setTypeface(Typeface.DEFAULT_BOLD);
         }
         return view;
+    }
+
+    private GradientDrawable cardBackground() {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(Color.WHITE);
+        drawable.setStroke(dp(1), Color.rgb(219, 226, 235));
+        drawable.setCornerRadius(dp(8));
+        return drawable;
+    }
+
+    private float carrierFrequency(GnssStatus status, int index) {
+        if (Build.VERSION.SDK_INT >= 26 && status.hasCarrierFrequencyHz(index)) {
+            return status.getCarrierFrequencyHz(index);
+        }
+        return Float.NaN;
+    }
+
+    private float basebandSignal(GnssStatus status, int index) {
+        if (Build.VERSION.SDK_INT >= 30 && status.hasBasebandCn0DbHz(index)) {
+            return status.getBasebandCn0DbHz(index);
+        }
+        return Float.NaN;
+    }
+
+    private String formatDegrees(float value) {
+        return String.format(Locale.US, "%.1f deg", value);
+    }
+
+    private String formatDb(float value) {
+        return String.format(Locale.US, "%.1f dB-Hz", value);
     }
 
     private String constellationName(int constellation) {
@@ -293,18 +352,40 @@ public class MainActivity extends Activity {
     private static final class SatelliteInfo {
         final int svid;
         final String constellation;
+        final int constellationType;
         final float azimuth;
         final float elevation;
         final float signal;
         final boolean usedInFix;
+        final boolean hasAlmanac;
+        final boolean hasEphemeris;
+        final float carrierFrequencyHz;
+        final float basebandCn0DbHz;
 
-        SatelliteInfo(int svid, String constellation, float azimuth, float elevation, float signal, boolean usedInFix) {
+        SatelliteInfo(
+                int svid,
+                String constellation,
+                int constellationType,
+                float azimuth,
+                float elevation,
+                float signal,
+                boolean usedInFix,
+                boolean hasAlmanac,
+                boolean hasEphemeris,
+                float carrierFrequencyHz,
+                float basebandCn0DbHz
+        ) {
             this.svid = svid;
             this.constellation = constellation;
+            this.constellationType = constellationType;
             this.azimuth = azimuth;
             this.elevation = elevation;
             this.signal = signal;
             this.usedInFix = usedInFix;
+            this.hasAlmanac = hasAlmanac;
+            this.hasEphemeris = hasEphemeris;
+            this.carrierFrequencyHz = carrierFrequencyHz;
+            this.basebandCn0DbHz = basebandCn0DbHz;
         }
     }
 
@@ -327,7 +408,7 @@ public class MainActivity extends Activity {
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            float size = Math.min(getWidth() - dp(36), getHeight() - dp(24));
+            float size = Math.min(getWidth() - dp(86), getHeight() - dp(60));
             float centerX = getWidth() / 2f;
             float centerY = getHeight() / 2f;
             float radius = size / 2f;
@@ -356,10 +437,33 @@ public class MainActivity extends Activity {
             paint.setTextSize(dp(14));
             paint.setTypeface(Typeface.DEFAULT_BOLD);
             paint.setTextAlign(Paint.Align.CENTER);
-            canvas.drawText("N", centerX, centerY - radius - dp(7), paint);
-            canvas.drawText("S", centerX, centerY + radius + dp(18), paint);
-            canvas.drawText("O", centerX - radius - dp(12), centerY + dp(5), paint);
-            canvas.drawText("E", centerX + radius + dp(12), centerY + dp(5), paint);
+            drawCompassLabel(canvas, "NORTE", centerX, centerY - radius - dp(18));
+            drawCompassLabel(canvas, "SUR", centerX, centerY + radius + dp(18));
+            drawCompassLabel(canvas, "OESTE", centerX - radius - dp(28), centerY);
+            drawCompassLabel(canvas, "ESTE", centerX + radius + dp(28), centerY);
+        }
+
+        private void drawCompassLabel(Canvas canvas, String label, float centerX, float centerY) {
+            paint.setTextSize(dp(12));
+            paint.setTypeface(Typeface.DEFAULT_BOLD);
+            paint.setTextAlign(Paint.Align.CENTER);
+            float width = paint.measureText(label) + dp(14);
+            float height = dp(22);
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.rgb(16, 42, 67));
+            canvas.drawRoundRect(
+                    centerX - width / 2f,
+                    centerY - height / 2f,
+                    centerX + width / 2f,
+                    centerY + height / 2f,
+                    dp(11),
+                    dp(11),
+                    paint
+            );
+
+            paint.setColor(Color.WHITE);
+            canvas.drawText(label, centerX, centerY + dp(4), paint);
         }
 
         private void drawSatellites(Canvas canvas, float centerX, float centerY, float radius) {
