@@ -2,6 +2,7 @@ package com.example.gpssatellites;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Intent;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Canvas;
@@ -12,10 +13,13 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.location.GnssStatus;
 import android.location.LocationManager;
+import android.location.LocationListener;
+import android.location.Location;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.LinearLayout;
@@ -38,7 +42,9 @@ public class MainActivity extends Activity {
     private SkyPlotView skyPlotView;
     private TextView statusView;
     private TextView summaryView;
+    private TextView actionView;
     private LinearLayout listLayout;
+    private boolean gnssStarted;
 
     private final GnssStatus.Callback gnssCallback = new GnssStatus.Callback() {
         @Override
@@ -88,12 +94,22 @@ public class MainActivity extends Activity {
         }
     };
 
+    private final LocationListener gpsWarmupListener = new LocationListener() {
+        @Override
+        public void onLocationChanged(Location location) {
+            if (satellites.isEmpty()) {
+                updateUi();
+            }
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
         buildUi();
         requestLocationPermission();
+        updateUi();
     }
 
     @Override
@@ -148,6 +164,25 @@ public class MainActivity extends Activity {
         summaryView.setPadding(dp(18), dp(12), dp(18), dp(10));
         root.addView(summaryView);
 
+        actionView = new TextView(this);
+        actionView.setText("Abrir ajustes de ubicacion");
+        actionView.setTextSize(14);
+        actionView.setTextColor(Color.WHITE);
+        actionView.setTypeface(Typeface.DEFAULT_BOLD);
+        actionView.setGravity(Gravity.CENTER);
+        actionView.setPadding(dp(16), dp(12), dp(16), dp(12));
+        actionView.setBackgroundColor(Color.rgb(16, 42, 67));
+        actionView.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
+            }
+        });
+        root.addView(actionView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+
         skyPlotView = new SkyPlotView(this);
         root.addView(skyPlotView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -177,26 +212,67 @@ public class MainActivity extends Activity {
     private void startGnss() {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             statusView.setText("Activa el permiso de ubicacion precisa para ver satelites");
+            actionView.setText("Conceder ubicacion precisa");
+            actionView.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    requestLocationPermission();
+                }
+            });
             return;
         }
         if (locationManager == null || !locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
             statusView.setText("Activa GPS/Ubicacion en el telefono");
+            actionView.setText("Abrir ajustes de ubicacion");
+            actionView.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
+                }
+            });
             return;
         }
         try {
-            locationManager.registerGnssStatusCallback(gnssCallback, handler);
+            if (!gnssStarted) {
+                locationManager.registerGnssStatusCallback(gnssCallback, handler);
+                locationManager.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        1000L,
+                        0f,
+                        gpsWarmupListener,
+                        Looper.getMainLooper()
+                );
+                gnssStarted = true;
+            }
             statusView.setText("Escaneando satelites GPS");
+            actionView.setText("Reintentar lectura");
+            actionView.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    restartGnss();
+                }
+            });
         } catch (SecurityException securityException) {
             statusView.setText("Sin permiso de ubicacion precisa");
+            actionView.setText("Conceder ubicacion precisa");
         } catch (RuntimeException runtimeException) {
             statusView.setText("No se pudo iniciar GNSS");
+            actionView.setText("Reintentar lectura");
         }
     }
 
     private void stopGnss() {
         if (locationManager != null) {
             locationManager.unregisterGnssStatusCallback(gnssCallback);
+            locationManager.removeUpdates(gpsWarmupListener);
         }
+        gnssStarted = false;
+    }
+
+    private void restartGnss() {
+        stopGnss();
+        startGnss();
+        updateUi();
     }
 
     private void updateUi() {
@@ -220,17 +296,34 @@ public class MainActivity extends Activity {
 
     private void updateList() {
         listLayout.removeAllViews();
-        if (satellites.isEmpty()) {
-            TextView empty = rowText("Todavia no hay datos. Salir al exterior mejora la recepcion.", 15, true);
-            empty.setPadding(dp(12), dp(14), dp(12), dp(14));
-            listLayout.addView(empty);
-            return;
-        }
-
         TextView sectionTitle = rowText("Listado completo de satelites", 18, true);
         sectionTitle.setTextColor(Color.rgb(16, 42, 67));
         sectionTitle.setPadding(0, 0, 0, dp(8));
         listLayout.addView(sectionTitle);
+
+        if (satellites.isEmpty()) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(dp(14), dp(12), dp(14), dp(12));
+            row.setBackground(cardBackground());
+
+            TextView empty = rowText("Todavia no hay satelites visibles.", 15, true);
+            empty.setTextColor(Color.rgb(16, 42, 67));
+            row.addView(empty);
+
+            TextView hint = rowText("Sal al exterior, activa Ubicacion precisa y espera unos segundos para que el receptor levante el cielo.", 13, false);
+            hint.setTextColor(Color.rgb(72, 84, 98));
+            hint.setPadding(0, dp(6), 0, 0);
+            row.addView(hint);
+
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+            );
+            params.setMargins(0, 0, 0, dp(8));
+            listLayout.addView(row, params);
+            return;
+        }
 
         for (SatelliteInfo satellite : satellites) {
             LinearLayout row = new LinearLayout(this);
@@ -321,6 +414,10 @@ public class MainActivity extends Activity {
     }
 
     private String formatDb(float value) {
+        return String.format(Locale.US, "%.1f dB-Hz", value);
+    }
+
+    private String formatSignal(float value) {
         return String.format(Locale.US, "%.1f dB-Hz", value);
     }
 
@@ -434,21 +531,21 @@ public class MainActivity extends Activity {
 
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(Color.rgb(16, 42, 67));
-            paint.setTextSize(dp(14));
+            paint.setTextSize(dp(16));
             paint.setTypeface(Typeface.DEFAULT_BOLD);
             paint.setTextAlign(Paint.Align.CENTER);
-            drawCompassLabel(canvas, "NORTE", centerX, centerY - radius - dp(18));
-            drawCompassLabel(canvas, "SUR", centerX, centerY + radius + dp(18));
-            drawCompassLabel(canvas, "OESTE", centerX - radius - dp(28), centerY);
-            drawCompassLabel(canvas, "ESTE", centerX + radius + dp(28), centerY);
+            drawCompassLabel(canvas, "NORTE", centerX, centerY - radius - dp(28));
+            drawCompassLabel(canvas, "SUR", centerX, centerY + radius + dp(30));
+            drawCompassLabel(canvas, "OESTE", centerX - radius - dp(34), centerY);
+            drawCompassLabel(canvas, "ESTE", centerX + radius + dp(34), centerY);
         }
 
         private void drawCompassLabel(Canvas canvas, String label, float centerX, float centerY) {
-            paint.setTextSize(dp(12));
+            paint.setTextSize(dp(13));
             paint.setTypeface(Typeface.DEFAULT_BOLD);
             paint.setTextAlign(Paint.Align.CENTER);
-            float width = paint.measureText(label) + dp(14);
-            float height = dp(22);
+            float width = paint.measureText(label) + dp(18);
+            float height = dp(26);
 
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(Color.rgb(16, 42, 67));
@@ -463,7 +560,7 @@ public class MainActivity extends Activity {
             );
 
             paint.setColor(Color.WHITE);
-            canvas.drawText(label, centerX, centerY + dp(4), paint);
+            canvas.drawText(label, centerX, centerY + dp(5), paint);
         }
 
         private void drawSatellites(Canvas canvas, float centerX, float centerY, float radius) {
