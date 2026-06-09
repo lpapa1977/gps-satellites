@@ -24,13 +24,16 @@ final class GnssDataStore {
 
     static final class GnssState {
         final List<SatelliteInfo> satellites = new ArrayList<>();
+        final List<Long> fixHistory = new ArrayList<>(); // timestamps of last 5 fixes
         Location location;
         String statusText = "Esperando permiso de ubicacion precisa";
         String summaryText = "Mapa del cielo: el centro es el cenit y el borde es el horizonte.";
+        String fixDiagnosis = "";
         boolean permissionGranted;
         boolean gpsEnabled;
         boolean tracking;
         long updatedAtMs;
+        long ttffMs = -1;
         int selectedSvid = -1;
 
         int visibleCount() {
@@ -40,9 +43,7 @@ final class GnssDataStore {
         int usedCount() {
             int count = 0;
             for (SatelliteInfo satellite : satellites) {
-                if (satellite.usedInFix) {
-                    count++;
-                }
+                if (satellite.usedInFix) count++;
             }
             return count;
         }
@@ -103,6 +104,7 @@ final class GnssDataStore {
     private final GnssState state = new GnssState();
     private LocationManager locationManager;
     private boolean running;
+    private int activeClients = 0; // ref count — GPS stops only when all clients release
 
     private final GnssStatus.Callback gnssCallback = new GnssStatus.Callback() {
         @Override
@@ -121,6 +123,7 @@ final class GnssDataStore {
 
         @Override
         public void onFirstFix(int ttffMillis) {
+            state.ttffMs = ttffMillis;
             state.statusText = String.format(Locale.US, "Primera posicion en %.1f s", ttffMillis / 1000f);
             notifyListeners();
         }
@@ -146,17 +149,15 @@ final class GnssDataStore {
             Collections.sort(state.satellites, new Comparator<SatelliteInfo>() {
                 @Override
                 public int compare(SatelliteInfo left, SatelliteInfo right) {
-                    if (left.usedInFix != right.usedInFix) {
-                        return left.usedInFix ? -1 : 1;
-                    }
+                    if (left.usedInFix != right.usedInFix) return left.usedInFix ? -1 : 1;
                     return Float.compare(right.signal, left.signal);
                 }
             });
             state.updatedAtMs = System.currentTimeMillis();
             state.summaryText = String.format(Locale.US,
                     "%d satelites visibles. %d usados para posicion.",
-                    state.visibleCount(),
-                    state.usedCount());
+                    state.visibleCount(), state.usedCount());
+            state.fixDiagnosis = computeDiagnosis();
             notifyListeners();
         }
     };
@@ -169,6 +170,9 @@ final class GnssDataStore {
             if (state.visibleCount() == 0) {
                 state.statusText = "GPS activo, esperando satelites";
             }
+            // keep last 5 fix timestamps
+            if (state.fixHistory.size() >= 5) state.fixHistory.remove(0);
+            state.fixHistory.add(System.currentTimeMillis());
             notifyListeners();
         }
     };
@@ -178,9 +182,7 @@ final class GnssDataStore {
     }
 
     void addListener(Listener listener) {
-        if (!listeners.contains(listener)) {
-            listeners.add(listener);
-        }
+        if (!listeners.contains(listener)) listeners.add(listener);
         listener.onGnssStateChanged(state);
     }
 
@@ -193,6 +195,7 @@ final class GnssDataStore {
     }
 
     void start() {
+        activeClients++;
         locationManager = (LocationManager) appContext.getSystemService(Context.LOCATION_SERVICE);
         state.permissionGranted = appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
         state.gpsEnabled = locationManager != null && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
@@ -222,22 +225,19 @@ final class GnssDataStore {
             locationManager.registerGnssStatusCallback(gnssCallback, handler);
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, gpsWarmupListener);
             Location lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (lastKnown != null) {
-                state.location = lastKnown;
-            }
+            if (lastKnown != null) state.location = lastKnown;
             state.tracking = true;
             state.statusText = "Escaneando satelites GPS";
             state.summaryText = String.format(Locale.US,
                     "%d satelites visibles. %d usados para posicion.",
-                    state.visibleCount(),
-                    state.usedCount());
+                    state.visibleCount(), state.usedCount());
             running = true;
             notifyListeners();
-        } catch (SecurityException securityException) {
+        } catch (SecurityException e) {
             state.tracking = false;
             state.statusText = "Sin permiso de ubicacion precisa";
             notifyListeners();
-        } catch (RuntimeException runtimeException) {
+        } catch (RuntimeException e) {
             state.tracking = false;
             state.statusText = "No se pudo iniciar GNSS";
             notifyListeners();
@@ -250,6 +250,8 @@ final class GnssDataStore {
     }
 
     void stop() {
+        activeClients = Math.max(0, activeClients - 1);
+        if (activeClients > 0) return; // other clients still active, keep GPS running
         if (locationManager != null && running) {
             locationManager.unregisterGnssStatusCallback(gnssCallback);
             locationManager.removeUpdates(gpsWarmupListener);
@@ -264,24 +266,36 @@ final class GnssDataStore {
         }
     }
 
+    private String computeDiagnosis() {
+        int used = state.usedCount();
+        int visible = state.satellites.size();
+        if (used >= 4) return "";
+        if (visible == 0) return "Buscando satelites...";
+
+        float totalCn0 = 0;
+        int withEphemeris = 0;
+        for (SatelliteInfo s : state.satellites) {
+            totalCn0 += s.signal;
+            if (s.hasEphemeris) withEphemeris++;
+        }
+        float avgCn0 = totalCn0 / visible;
+
+        if (avgCn0 < 20f) return "Senal debil - busca cielo abierto";
+        if (withEphemeris < 4) return "Descargando efemerides (" + withEphemeris + "/" + visible + ")";
+        if (used == 0) return "Calculando posicion...";
+        return "Fix parcial (" + used + " satelites)";
+    }
+
     private String constellationName(int constellation) {
         switch (constellation) {
-            case GnssStatus.CONSTELLATION_GPS:
-                return "GPS";
-            case GnssStatus.CONSTELLATION_GLONASS:
-                return "GLONASS";
-            case GnssStatus.CONSTELLATION_GALILEO:
-                return "Galileo";
-            case GnssStatus.CONSTELLATION_BEIDOU:
-                return "BeiDou";
-            case GnssStatus.CONSTELLATION_QZSS:
-                return "QZSS";
-            case GnssStatus.CONSTELLATION_SBAS:
-                return "SBAS";
-            case GnssStatus.CONSTELLATION_IRNSS:
-                return "IRNSS";
-            default:
-                return "GNSS";
+            case GnssStatus.CONSTELLATION_GPS:      return "GPS";
+            case GnssStatus.CONSTELLATION_GLONASS:  return "GLONASS";
+            case GnssStatus.CONSTELLATION_GALILEO:  return "Galileo";
+            case GnssStatus.CONSTELLATION_BEIDOU:   return "BeiDou";
+            case GnssStatus.CONSTELLATION_QZSS:     return "QZSS";
+            case GnssStatus.CONSTELLATION_SBAS:     return "SBAS";
+            case GnssStatus.CONSTELLATION_IRNSS:    return "IRNSS";
+            default:                                return "GNSS";
         }
     }
 

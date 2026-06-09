@@ -7,11 +7,10 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
+import android.hardware.GeomagneticField;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
-import android.hardware.GeomagneticField;
 import android.hardware.SensorManager;
 import android.location.Location;
 import android.os.Bundle;
@@ -23,6 +22,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
@@ -31,7 +32,9 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
     private TextView statusView;
     private TextView summaryView;
     private TextView locationView;
+    private TextView diagnosisView;
     private TextView actionView;
+    private TextView fixHistoryView;
     private SkyPlotView skyPlotView;
     private LinearLayout infoPanel;
 
@@ -42,6 +45,12 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
     private float declination;
     private float smoothedHeading;
     private boolean hasHeading;
+
+    // cached to avoid recomputing on every GNSS update
+    private GeomagneticField geoField;
+    private Location lastFieldLocation;
+
+    private static final SimpleDateFormat TIME_FMT = new SimpleDateFormat("HH:mm:ss", Locale.US);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -79,15 +88,10 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         statusView.setText(state.statusText);
         summaryView.setText(state.summaryText);
         skyPlotView.setSatellites(state.satellites);
-        locationView.setText(formatLocation(state.location));
-        if (state.location != null) {
-            GeomagneticField field = new GeomagneticField(
-                    (float) state.location.getLatitude(),
-                    (float) state.location.getLongitude(),
-                    (float) state.location.getAltitude(),
-                    System.currentTimeMillis());
-            declination = field.getDeclination();
-        }
+        locationView.setText(formatLocation(state.location, state.ttffMs));
+        updateDiagnosis(state);
+        updateFixHistory(state);
+        updateGeoField(state.location);
         updateAction(state);
         skyPlotView.setSelectedSvid(state.selectedSvid);
         updateInfoPanel(state);
@@ -95,9 +99,7 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() != Sensor.TYPE_ROTATION_VECTOR) {
-            return;
-        }
+        if (event.sensor.getType() != Sensor.TYPE_ROTATION_VECTOR) return;
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
         SensorManager.getOrientation(rotationMatrix, orientation);
         float trueHeading = (float) Math.toDegrees(orientation[0]) + declination;
@@ -116,49 +118,107 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
     public void onAccuracyChanged(Sensor sensor, int accuracy) {
     }
 
+    private void updateGeoField(Location location) {
+        if (location == null) return;
+        if (lastFieldLocation != null && location.distanceTo(lastFieldLocation) < 5000f) return;
+        geoField = new GeomagneticField(
+                (float) location.getLatitude(),
+                (float) location.getLongitude(),
+                (float) location.getAltitude(),
+                System.currentTimeMillis());
+        declination = geoField.getDeclination();
+        lastFieldLocation = location;
+    }
+
+    private void updateDiagnosis(GnssDataStore.GnssState state) {
+        if (state.fixDiagnosis.isEmpty()) {
+            diagnosisView.setVisibility(View.GONE);
+        } else {
+            diagnosisView.setText("⚠ " + state.fixDiagnosis);
+            diagnosisView.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void updateFixHistory(GnssDataStore.GnssState state) {
+        if (state.fixHistory.isEmpty()) {
+            fixHistoryView.setVisibility(View.GONE);
+            return;
+        }
+        StringBuilder sb = new StringBuilder("Ultimos fixes: ");
+        for (int i = state.fixHistory.size() - 1; i >= 0; i--) {
+            if (i < state.fixHistory.size() - 1) sb.append(" · ");
+            sb.append(TIME_FMT.format(new Date(state.fixHistory.get(i))));
+        }
+        fixHistoryView.setText(sb.toString());
+        fixHistoryView.setVisibility(View.VISIBLE);
+    }
+
+    private void updateAction(GnssDataStore.GnssState state) {
+        if (!state.permissionGranted) {
+            actionView.setText("Conceder ubicacion precisa");
+            actionView.setVisibility(View.VISIBLE);
+            actionView.setOnClickListener(v ->
+                    requestPermissions(new String[]{android.Manifest.permission.ACCESS_FINE_LOCATION}, 42));
+            return;
+        }
+        if (!state.gpsEnabled) {
+            actionView.setText("Abrir ajustes de ubicacion");
+            actionView.setVisibility(View.VISIBLE);
+            actionView.setOnClickListener(v ->
+                    startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)));
+            return;
+        }
+        actionView.setVisibility(View.GONE);
+    }
+
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(246, 247, 249));
 
-        root.addView(sectionHeader("GPS Satellites"));
-        root.addView(buttonRow());
+        root.addView(UiKit.sectionHeader(this, "GPS Satellites"));
+        root.addView(buildButtonRow());
 
-        statusView = chip("Esperando ubicacion");
+        statusView = UiKit.chip(this, "Esperando ubicacion");
         root.addView(statusView);
 
-        summaryView = bodyText("Mapa del cielo: el centro es el cenit y el borde es el horizonte.");
+        summaryView = UiKit.bodyText(this, "Mapa del cielo: el centro es el cenit y el borde es el horizonte.");
         summaryView.setPadding(dp(18), dp(12), dp(18), dp(4));
         root.addView(summaryView);
 
-        locationView = bodyText("Ubicacion actual: esperando fix");
-        locationView.setPadding(dp(18), dp(4), dp(18), dp(10));
+        locationView = UiKit.bodyText(this, "Ubicacion actual: esperando fix");
+        locationView.setPadding(dp(18), dp(4), dp(18), dp(2));
         root.addView(locationView);
 
-        actionView = actionButton("Abrir ajustes de ubicacion");
+        diagnosisView = UiKit.bodyText(this, "");
+        diagnosisView.setTextColor(Color.rgb(180, 100, 0));
+        diagnosisView.setPadding(dp(18), dp(2), dp(18), dp(2));
+        diagnosisView.setVisibility(View.GONE);
+        root.addView(diagnosisView);
+
+        fixHistoryView = UiKit.bodyText(this, "");
+        fixHistoryView.setTextColor(Color.rgb(100, 120, 140));
+        fixHistoryView.setTextSize(12);
+        fixHistoryView.setPadding(dp(18), dp(2), dp(18), dp(8));
+        fixHistoryView.setVisibility(View.GONE);
+        root.addView(fixHistoryView);
+
+        actionView = buildActionButton();
         root.addView(actionView);
 
         skyPlotView = new SkyPlotView(this);
-        skyPlotView.setOnSatelliteTapListener(new SkyPlotView.OnSatelliteTapListener() {
-            @Override
-            public void onSatelliteTapped(GnssDataStore.SatelliteInfo satellite) {
-                dataStore.selectSatellite(satellite.svid);
-            }
-        });
+        skyPlotView.setOnSatelliteTapListener(satellite -> dataStore.selectSatellite(satellite.svid));
         root.addView(skyPlotView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(380)
-        ));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(380)));
 
         View divider = new View(this);
         divider.setBackgroundColor(Color.rgb(209, 218, 228));
-        root.addView(divider, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
+        root.addView(divider, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
 
         infoPanel = new LinearLayout(this);
         infoPanel.setOrientation(LinearLayout.VERTICAL);
         infoPanel.setPadding(dp(18), dp(16), dp(18), dp(24));
-        TextView placeholder = bodyText("Toca un satelite en el mapa para ver sus datos");
+        TextView placeholder = UiKit.bodyText(this, "Toca un satelite en el mapa para ver sus datos");
         placeholder.setTextColor(Color.rgb(160, 168, 178));
         infoPanel.addView(placeholder);
         root.addView(infoPanel);
@@ -169,137 +229,49 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         setContentView(scrollView);
     }
 
-    private View sectionHeader(String title) {
-        TextView view = new TextView(this);
-        view.setText(title);
-        view.setTextSize(28);
-        view.setTextColor(Color.rgb(16, 42, 67));
-        view.setTypeface(Typeface.DEFAULT_BOLD);
-        view.setPadding(dp(18), dp(20), dp(18), dp(4));
-        return view;
-    }
-
-    private LinearLayout buttonRow() {
+    private LinearLayout buildButtonRow() {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(dp(18), 0, dp(18), dp(8));
 
-        TextView mapButton = navButton("Mapa", true);
-        row.addView(mapButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(UiKit.navButton(this, "Mapa", true),
+                new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        TextView satellitesButton = navButton("Satelites", false);
-        satellitesButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivity(new Intent(MainActivity.this, SatellitesActivity.class));
-            }
-        });
-        LinearLayout.LayoutParams satellitesParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        satellitesParams.setMargins(dp(8), 0, 0, 0);
-        row.addView(satellitesButton, satellitesParams);
+        TextView satellitesButton = UiKit.navButton(this, "Satelites", false);
+        satellitesButton.setOnClickListener(v -> startActivity(new Intent(this, SatellitesActivity.class)));
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        p.setMargins(dp(8), 0, 0, 0);
+        row.addView(satellitesButton, p);
         return row;
     }
 
-    private TextView navButton(String text, boolean selected) {
+    private TextView buildActionButton() {
         TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(14);
-        view.setTypeface(Typeface.DEFAULT_BOLD);
-        view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(14), dp(12), dp(14), dp(12));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(8));
-        bg.setColor(selected ? Color.rgb(16, 42, 67) : Color.WHITE);
-        bg.setStroke(dp(1), Color.rgb(210, 219, 228));
-        view.setBackground(bg);
-        view.setTextColor(selected ? Color.WHITE : Color.rgb(16, 42, 67));
-        return view;
-    }
-
-    private TextView chip(String text) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(15);
-        view.setTextColor(Color.WHITE);
-        view.setTypeface(Typeface.DEFAULT_BOLD);
-        view.setPadding(dp(18), dp(10), dp(18), dp(10));
-        view.setBackgroundColor(Color.rgb(32, 92, 122));
-        return view;
-    }
-
-    private TextView bodyText(String text) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(14);
-        view.setTextColor(Color.rgb(72, 84, 98));
-        return view;
-    }
-
-    private TextView actionButton(String text) {
-        TextView view = new TextView(this);
-        view.setText(text);
         view.setTextSize(14);
         view.setTextColor(Color.WHITE);
         view.setTypeface(Typeface.DEFAULT_BOLD);
         view.setGravity(Gravity.CENTER);
         view.setPadding(dp(16), dp(12), dp(16), dp(12));
         view.setBackgroundColor(Color.rgb(16, 42, 67));
-        view.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
-            }
-        });
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        );
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         params.setMargins(dp(18), dp(4), dp(18), dp(12));
         view.setLayoutParams(params);
         return view;
     }
 
-    private void updateAction(final GnssDataStore.GnssState state) {
-        if (!state.permissionGranted) {
-            actionView.setText("Conceder ubicacion precisa");
-            actionView.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    requestPermissions(new String[]{android.Manifest.permission.ACCESS_FINE_LOCATION}, 42);
-                }
-            });
-            return;
-        }
-        if (!state.gpsEnabled) {
-            actionView.setText("Abrir ajustes de ubicacion");
-            actionView.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
-                }
-            });
-            return;
-        }
-        actionView.setText("Abrir ajustes de ubicacion");
-        actionView.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
-            }
-        });
-    }
-
-    private String formatLocation(Location location) {
-        if (location == null) {
-            return "Ubicacion actual: esperando fix GPS";
-        }
-        return String.format(
-                Locale.US,
-                "Ubicacion actual: %.6f, %.6f | precision %.1f m%s",
+    private String formatLocation(Location location, long ttffMs) {
+        if (location == null) return "Ubicacion actual: esperando fix GPS";
+        String ttff = ttffMs > 0
+                ? String.format(Locale.US, " | TTFF %.1f s", ttffMs / 1000f)
+                : "";
+        return String.format(Locale.US,
+                "Ubicacion: %.6f, %.6f | prec %.1f m%s%s",
                 location.getLatitude(),
                 location.getLongitude(),
                 location.hasAccuracy() ? location.getAccuracy() : 0f,
-                location.hasAltitude() ? String.format(Locale.US, " | altitud %.1f m", location.getAltitude()) : ""
+                location.hasAltitude() ? String.format(Locale.US, " | alt %.1f m", location.getAltitude()) : "",
+                ttff
         );
     }
 
@@ -309,21 +281,18 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         GnssDataStore.SatelliteInfo selected = null;
         if (state.selectedSvid != -1) {
             for (GnssDataStore.SatelliteInfo sat : state.satellites) {
-                if (sat.svid == state.selectedSvid) {
-                    selected = sat;
-                    break;
-                }
+                if (sat.svid == state.selectedSvid) { selected = sat; break; }
             }
         }
 
         if (selected == null) {
-            TextView placeholder = bodyText("Toca un satelite en el mapa para ver sus datos");
+            TextView placeholder = UiKit.bodyText(this, "Toca un satelite en el mapa para ver sus datos");
             placeholder.setTextColor(Color.rgb(160, 168, 178));
             infoPanel.addView(placeholder);
             return;
         }
 
-        String band = bandName(selected.carrierFrequencyHz);
+        String band = UiKit.bandName(selected.carrierFrequencyHz);
 
         TextView title = new TextView(this);
         title.setText(String.format(Locale.US, "%s · SV %d%s",
@@ -341,44 +310,17 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         usedView.setPadding(0, dp(4), 0, dp(10));
         infoPanel.addView(usedView);
 
-        addInfoRow(infoPanel, "Elevacion", String.format(Locale.US, "%.0f°", selected.elevation));
-        addInfoRow(infoPanel, "Azimut", String.format(Locale.US, "%.0f°", selected.azimuth));
-        addInfoRow(infoPanel, "Senal (CN0)", String.format(Locale.US, "%.0f dBHz", selected.signal));
-        addInfoRow(infoPanel, "Efemerides", selected.hasEphemeris ? "si" : "no");
-        addInfoRow(infoPanel, "Almanaque", selected.hasAlmanac ? "si" : "no");
-    }
-
-    private void addInfoRow(LinearLayout parent, String label, String value) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, dp(3), 0, dp(3));
-
-        TextView labelView = new TextView(this);
-        labelView.setText(label);
-        labelView.setTextSize(13);
-        labelView.setTextColor(Color.rgb(120, 132, 146));
-        row.addView(labelView, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-        TextView valueView = new TextView(this);
-        valueView.setText(value);
-        valueView.setTextSize(13);
-        valueView.setTypeface(Typeface.DEFAULT_BOLD);
-        valueView.setTextColor(Color.rgb(16, 42, 67));
-        row.addView(valueView);
-
-        parent.addView(row);
-    }
-
-    private String bandName(float carrierFrequencyHz) {
-        if (Float.isNaN(carrierFrequencyHz) || carrierFrequencyHz <= 0f) {
-            return "";
+        UiKit.addInfoRow(this, infoPanel, "Elevacion", String.format(Locale.US, "%.0f°", selected.elevation));
+        UiKit.addInfoRow(this, infoPanel, "Azimut", String.format(Locale.US, "%.0f°", selected.azimuth));
+        UiKit.addInfoRow(this, infoPanel, "Senal (CN0)", String.format(Locale.US, "%.1f dBHz", selected.signal));
+        if (!Float.isNaN(selected.basebandCn0DbHz)) {
+            UiKit.addInfoRow(this, infoPanel, "Senal baseband", String.format(Locale.US, "%.1f dBHz", selected.basebandCn0DbHz));
         }
-        float mhz = carrierFrequencyHz / 1_000_000f;
-        if (mhz > 1565f && mhz < 1615f) return "L1";
-        if (mhz > 1215f && mhz < 1255f) return "L2";
-        if (mhz > 1192f && mhz < 1212f) return "E5b";
-        if (mhz > 1160f && mhz < 1192f) return "L5";
-        return String.format(Locale.US, "%.0f MHz", mhz);
+        if (!Float.isNaN(selected.carrierFrequencyHz) && selected.carrierFrequencyHz > 0) {
+            UiKit.addInfoRow(this, infoPanel, "Frecuencia", String.format(Locale.US, "%.2f MHz", selected.carrierFrequencyHz / 1_000_000f));
+        }
+        UiKit.addInfoRow(this, infoPanel, "Efemerides", selected.hasEphemeris ? "si" : "no");
+        UiKit.addInfoRow(this, infoPanel, "Almanaque", selected.hasAlmanac ? "si" : "no");
     }
 
     private int dp(int value) {
@@ -390,7 +332,17 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
             void onSatelliteTapped(GnssDataStore.SatelliteInfo satellite);
         }
 
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        // Pre-created paints — never mutated in onDraw
+        private final Paint bgFill;
+        private final Paint gridStroke;
+        private final Paint satUsedFill;
+        private final Paint satIdleFill;
+        private final Paint satRingStroke;
+        private final Paint satSelectedRing;
+        private final Paint satTextPaint;
+        private final Paint compassFill;
+        private final Paint compassText;
+
         private final List<GnssDataStore.SatelliteInfo> satellites = new java.util.ArrayList<>();
         private final RectF labelBounds = new RectF();
         private float headingDegrees;
@@ -400,6 +352,46 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         SkyPlotView(android.content.Context context) {
             super(context);
             setBackgroundColor(Color.rgb(246, 247, 249));
+
+            bgFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            bgFill.setStyle(Paint.Style.FILL);
+            bgFill.setColor(Color.WHITE);
+
+            gridStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+            gridStroke.setStyle(Paint.Style.STROKE);
+            gridStroke.setColor(Color.rgb(209, 218, 228));
+
+            satUsedFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            satUsedFill.setStyle(Paint.Style.FILL);
+            satUsedFill.setColor(Color.rgb(30, 125, 88));
+
+            satIdleFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            satIdleFill.setStyle(Paint.Style.FILL);
+            satIdleFill.setColor(Color.rgb(244, 176, 55));
+
+            satRingStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+            satRingStroke.setStyle(Paint.Style.STROKE);
+            satRingStroke.setColor(Color.WHITE);
+
+            satSelectedRing = new Paint(Paint.ANTI_ALIAS_FLAG);
+            satSelectedRing.setStyle(Paint.Style.STROKE);
+            satSelectedRing.setColor(Color.rgb(16, 42, 67));
+
+            satTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            satTextPaint.setStyle(Paint.Style.FILL);
+            satTextPaint.setColor(Color.WHITE);
+            satTextPaint.setTypeface(Typeface.DEFAULT_BOLD);
+            satTextPaint.setTextAlign(Paint.Align.CENTER);
+
+            compassFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            compassFill.setStyle(Paint.Style.FILL);
+            compassFill.setColor(Color.rgb(16, 42, 67));
+
+            compassText = new Paint(Paint.ANTI_ALIAS_FLAG);
+            compassText.setStyle(Paint.Style.FILL);
+            compassText.setColor(Color.WHITE);
+            compassText.setTypeface(Typeface.DEFAULT_BOLD);
+            compassText.setTextAlign(Paint.Align.CENTER);
         }
 
         void setSatellites(List<GnssDataStore.SatelliteInfo> items) {
@@ -409,9 +401,7 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         }
 
         void setHeading(float degrees) {
-            if (Math.abs(degrees - headingDegrees) < 0.5f) {
-                return;
-            }
+            if (Math.abs(degrees - headingDegrees) < 0.5f) return;
             headingDegrees = degrees;
             invalidate();
         }
@@ -430,9 +420,7 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
         public boolean onTouchEvent(MotionEvent event) {
             if (event.getAction() == MotionEvent.ACTION_UP && tapListener != null) {
                 GnssDataStore.SatelliteInfo sat = findSatelliteAt(event.getX(), event.getY());
-                if (sat != null) {
-                    tapListener.onSatelliteTapped(sat);
-                }
+                if (sat != null) tapListener.onSatelliteTapped(sat);
             }
             return true;
         }
@@ -444,7 +432,6 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
             float centerX = width / 2f;
             float centerY = height / 2f;
 
-            // Inverse-rotate the touch point to match the rotated canvas space
             float dx = touchX - centerX;
             float dy = touchY - centerY;
             double rad = Math.toRadians(headingDegrees);
@@ -460,12 +447,8 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
                 double angle = Math.toRadians(satellite.azimuth - 90f);
                 float x = centerX + (float) Math.cos(angle) * dist2Center;
                 float y = centerY + (float) Math.sin(angle) * dist2Center;
-
                 float dist = (float) Math.hypot(rotX - x, rotY - y);
-                if (dist < nearestDist) {
-                    nearestDist = dist;
-                    nearest = satellite;
-                }
+                if (dist < nearestDist) { nearestDist = dist; nearest = satellite; }
             }
             return nearest;
         }
@@ -482,23 +465,24 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
             canvas.save();
             canvas.rotate(-headingDegrees, centerX, centerY);
 
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.WHITE);
-            canvas.drawCircle(centerX, centerY, radius, paint);
+            canvas.drawCircle(centerX, centerY, radius, bgFill);
 
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(dp(2));
-            paint.setColor(Color.rgb(209, 218, 228));
-            canvas.drawCircle(centerX, centerY, radius, paint);
-            canvas.drawCircle(centerX, centerY, radius * 0.66f, paint);
-            canvas.drawCircle(centerX, centerY, radius * 0.33f, paint);
-            canvas.drawLine(centerX, centerY - radius, centerX, centerY + radius, paint);
-            canvas.drawLine(centerX - radius, centerY, centerX + radius, centerY, paint);
+            gridStroke.setStrokeWidth(dp(2));
+            canvas.drawCircle(centerX, centerY, radius, gridStroke);
+            canvas.drawCircle(centerX, centerY, radius * 0.66f, gridStroke);
+            canvas.drawCircle(centerX, centerY, radius * 0.33f, gridStroke);
+            gridStroke.setStrokeWidth(dp(1));
+            canvas.drawLine(centerX, centerY - radius, centerX, centerY + radius, gridStroke);
+            canvas.drawLine(centerX - radius, centerY, centerX + radius, centerY, gridStroke);
 
             drawCompassBadge(canvas, "NORTE", centerX, centerY - radius + dp(24));
-            drawCompassBadge(canvas, "SUR", centerX, centerY + radius - dp(24));
+            drawCompassBadge(canvas, "SUR",   centerX, centerY + radius - dp(24));
             drawCompassBadge(canvas, "OESTE", centerX - radius + dp(34), centerY);
-            drawCompassBadge(canvas, "ESTE", centerX + radius - dp(34), centerY);
+            drawCompassBadge(canvas, "ESTE",  centerX + radius - dp(34), centerY);
+
+            satRingStroke.setStrokeWidth(dp(2));
+            satSelectedRing.setStrokeWidth(dp(3));
+            satTextPaint.setTextSize(dp(10));
 
             for (GnssDataStore.SatelliteInfo satellite : satellites) {
                 float distance = radius * (1f - Math.max(0f, Math.min(90f, satellite.elevation)) / 90f);
@@ -508,47 +492,24 @@ public class MainActivity extends Activity implements GnssDataStore.Listener, Se
                 float dotRadius = satellite.usedInFix ? dp(11) : dp(9);
 
                 if (satellite.svid == selectedSvid) {
-                    paint.setStyle(Paint.Style.STROKE);
-                    paint.setStrokeWidth(dp(3));
-                    paint.setColor(Color.rgb(16, 42, 67));
-                    canvas.drawCircle(x, y, dotRadius + dp(7), paint);
+                    canvas.drawCircle(x, y, dotRadius + dp(7), satSelectedRing);
                 }
-
-                paint.setStyle(Paint.Style.FILL);
-                paint.setColor(satellite.usedInFix ? Color.rgb(30, 125, 88) : Color.rgb(244, 176, 55));
-                canvas.drawCircle(x, y, dotRadius, paint);
-
-                paint.setStyle(Paint.Style.STROKE);
-                paint.setStrokeWidth(dp(2));
-                paint.setColor(Color.WHITE);
-                canvas.drawCircle(x, y, dotRadius, paint);
-
-                paint.setStyle(Paint.Style.FILL);
-                paint.setTextSize(dp(10));
-                paint.setTypeface(Typeface.DEFAULT_BOLD);
-                paint.setTextAlign(Paint.Align.CENTER);
-                paint.setColor(Color.WHITE);
-                canvas.drawText(String.valueOf(satellite.svid), x, y + dp(4), paint);
+                canvas.drawCircle(x, y, dotRadius, satellite.usedInFix ? satUsedFill : satIdleFill);
+                canvas.drawCircle(x, y, dotRadius, satRingStroke);
+                canvas.drawText(String.valueOf(satellite.svid), x, y + dp(4), satTextPaint);
             }
 
             canvas.restore();
         }
 
-        private void drawCompassBadge(Canvas canvas, String label, float centerX, float centerY) {
-            paint.setTextSize(dp(12));
-            paint.setTypeface(Typeface.DEFAULT_BOLD);
-            paint.setTextAlign(Paint.Align.CENTER);
-            float textWidth = paint.measureText(label);
-            float width = textWidth + dp(20);
-            float height = dp(26);
-            labelBounds.set(centerX - width / 2f, centerY - height / 2f, centerX + width / 2f, centerY + height / 2f);
-
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.rgb(16, 42, 67));
-            canvas.drawRoundRect(labelBounds, dp(11), dp(11), paint);
-
-            paint.setColor(Color.WHITE);
-            canvas.drawText(label, centerX, centerY + dp(5), paint);
+        private void drawCompassBadge(Canvas canvas, String label, float cx, float cy) {
+            compassText.setTextSize(dp(12));
+            float textWidth = compassText.measureText(label);
+            float w = textWidth + dp(20);
+            float h = dp(26);
+            labelBounds.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f);
+            canvas.drawRoundRect(labelBounds, dp(11), dp(11), compassFill);
+            canvas.drawText(label, cx, cy + dp(5), compassText);
         }
 
         private int dp(int value) {
